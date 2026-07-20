@@ -1,0 +1,24 @@
+# Excel
+openpyxl>=3.1.2
+pandas>=2.2.2
+
+# PDF generation/editing
+pypdf>=5.0.0
+reportlab>=4.2.2
+pymupdf>=1.24.9
+
+# Data validation
+jsonschema>=4.23.0
+
+# Date handling
+python-dateutil>=2.9.0
+
+# Command-line interface
+typer>=0.12.3
+rich>=13.8.0
+
+# Configuration
+PyYAML>=6.0.2
+
+# Logging
+loguru>=0.7.2
