@@ -1,0 +1,499 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from dataclasses import dataclass, asdict
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from openpyxl import load_workbook
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def norm(text: str) -> str:
+    text = text or ""
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def parse_date(value) -> Optional[date]:
+    if value in (None, "", "null"):
+        return None
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    # Best-effort if year-only is given as an int-like string
+    if re.fullmatch(r"\d{4}", s):
+        return date(int(s), 1, 1)
+    raise ValueError(f"Could not parse date: {value!r}")
+
+
+def years_between(earlier: Optional[date], later: Optional[date]) -> Optional[float]:
+    if earlier is None or later is None:
+        return None
+    return (later - earlier).days / 365.25
+
+
+def pick_first_nonempty(*values):
+    for v in values:
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def split_tokens(value: str) -> List[str]:
+    if not value:
+        return []
+    return [t.strip() for t in re.split(r"[;,/|]", value) if t.strip()]
+
+
+# -----------------------------
+# Workbook loading
+# -----------------------------
+
+@dataclass
+class OffenseRule:
+    normalized_offense: str
+    aliases: List[str]
+    statute: str
+    classification: str
+    severity: str
+    policy_flags: str
+    notes: str
+
+    @property
+    def aliases_norm(self) -> List[str]:
+        return [norm(x) for x in self.aliases]
+
+
+@dataclass
+class JobRule:
+    position: str
+    related_categories: List[str]
+    financial_duties: bool
+    student_contact: bool
+    notes: str
+
+    @property
+    def related_categories_norm(self) -> List[str]:
+        return [norm(x) for x in self.related_categories]
+
+
+def load_rules_workbook(path: Path) -> Tuple[List[OffenseRule], Dict[str, JobRule]]:
+    wb = load_workbook(path, data_only=True)
+
+    # Offense Rules
+    offense_sheet = wb["Offense Rules"]
+    offense_rules: List[OffenseRule] = []
+    for row in offense_sheet.iter_rows(min_row=5, values_only=True):
+        if not row or all(v in (None, "") for v in row):
+            continue
+        normalized_offense = str(row[0] or "").strip()
+        aliases = split_tokens(str(row[1] or ""))
+        statute = str(row[2] or "").strip()
+        classification = str(row[3] or "").strip()
+        severity = str(row[4] or "").strip()
+        policy_flags = str(row[5] or "").strip()
+        notes = str(row[7] or "").strip() if len(row) > 7 else ""
+        offense_rules.append(
+            OffenseRule(
+                normalized_offense=normalized_offense,
+                aliases=aliases,
+                statute=statute,
+                classification=classification,
+                severity=severity,
+                policy_flags=policy_flags,
+                notes=notes,
+            )
+        )
+
+    # Job Matrix
+    job_sheet = wb["Job Matrix"]
+    job_rules: Dict[str, JobRule] = {}
+    for row in job_sheet.iter_rows(min_row=5, values_only=True):
+        if not row or all(v in (None, "") for v in row):
+            continue
+        position = str(row[0] or "").strip()
+        related_categories = split_tokens(str(row[2] or ""))
+        financial_duties = str(row[4] or "").strip().lower() in ("yes", "true", "y", "1")
+        student_contact = str(row[5] or "").strip().lower() in ("yes", "true", "y", "1")
+        notes = str(row[6] or "").strip() if len(row) > 6 else ""
+        job_rules[norm(position)] = JobRule(
+            position=position,
+            related_categories=related_categories,
+            financial_duties=financial_duties,
+            student_contact=student_contact,
+            notes=notes,
+        )
+
+    return offense_rules, job_rules
+
+
+def match_offense_rule(offense_text: str, rules: List[OffenseRule]) -> OffenseRule:
+    o = norm(offense_text)
+    for rule in rules:
+        if o == norm(rule.normalized_offense):
+            return rule
+    for rule in rules:
+        if o in rule.aliases_norm:
+            return rule
+    for rule in rules:
+        if norm(rule.normalized_offense) and norm(rule.normalized_offense) in o:
+            return rule
+    for rule in rules:
+        for alias in rule.aliases_norm:
+            if alias and alias in o:
+                return rule
+    raise KeyError(f"No offense rule found for: {offense_text!r}")
+
+
+# -----------------------------
+# Policy logic
+# -----------------------------
+
+def classify_family(classification: str) -> str:
+    c = classification.lower()
+    if "felony" in c or re.search(r"\bf\d\b|\bfx\b|\bfs\b", c):
+        return "felony"
+    if "class a" in c or "class b" in c:
+        return "class_ab"
+    if "class c" in c:
+        return "class_c"
+    return "unknown"
+
+
+def infer_offense_categories(offense_text: str, rule: OffenseRule) -> List[str]:
+    text = norm(offense_text)
+    combined = f"{rule.normalized_offense} {' '.join(rule.aliases)} {rule.notes}".lower()
+
+    categories = []
+    if any(k in text for k in ["assault", "battery", "robbery", "violence", "attack", "homicide", "murder"]):
+        categories.append("violence")
+    if any(k in text for k in ["burglary", "theft", "trespass", "mischief", "criminal mischief", "criminal trespass"]):
+        categories.append("property")
+    if any(k in text for k in ["dwi", "dui", "intox", "driving while intoxicated", "driving under the influence"]):
+        categories.append("vehicle safety")
+    if any(k in text for k in ["fraud", "forgery", "embezzlement", "deceptive", "tamper", "identity", "false statement", "check"]):
+        categories.append("dishonesty")
+    if any(k in text for k in ["drug", "controlled substance", "marijuana", "cocaine", "possession"]):
+        categories.append("drug")
+    if any(k in text for k in ["sexual", "sex", "child pornography", "indecency"]):
+        categories.append("sexual")
+    return categories
+
+
+def relation_to_position(offense_categories: List[str], job: JobRule, offense_text: str) -> bool:
+    job_cats = set(job.related_categories_norm)
+    offense_set = set(offense_categories)
+
+    # Direct category overlap is a strong yes.
+    if offense_set & job_cats:
+        return True
+
+    # Conservative position-specific rules.
+    if "bus driver" in norm(job.position):
+        if any(c in offense_set for c in {"violence", "vehicle safety", "sexual"}):
+            return True
+        return False
+
+    if job.financial_duties:
+        if any(c in offense_set for c in {"property", "dishonesty", "drug", "sexual", "violence"}):
+            return True
+        return False
+
+    if job.student_contact:
+        if any(c in offense_set for c in {"violence", "sexual", "drug"}):
+            return True
+
+    # Last resort: if no rule catches it, use overlap with related categories keywords.
+    return False
+
+
+def parse_policy_flags(policy_flags: str) -> Dict[str, bool]:
+    flags = {k: False for k in ["prohibited", "moral_turpitude", "felony"]}
+    for part in split_tokens(policy_flags):
+        p = norm(part)
+        if "prohibited" in p:
+            flags["prohibited"] = "not" not in p and "no" not in p and "false" not in p
+        if "moral turpitude" in p:
+            flags["moral_turpitude"] = "not" not in p and "no" not in p and "false" not in p
+        if "felony" in p:
+            flags["felony"] = "not" not in p and "no" not in p and "false" not in p
+    return flags
+
+
+def build_path_map(
+    offense_text: str,
+    offense_date: date,
+    review_date: date,
+    disposition: Optional[str],
+    rule: OffenseRule,
+    job: JobRule,
+    treat_arrest_as_conviction: bool = True,
+    treat_deferred_as_conviction: bool = True,
+) -> Dict:
+    family = classify_family(rule.classification)
+    flags = parse_policy_flags(rule.policy_flags)
+    categories = infer_offense_categories(offense_text, rule)
+    related = relation_to_position(categories, job, offense_text)
+    years = years_between(offense_date, review_date)
+
+    disposition_norm = norm(disposition or "")
+    is_conviction_like = (
+        treat_arrest_as_conviction
+        or "deferred" in disposition_norm
+        or "guilty" in disposition_norm
+        or "no contest" in disposition_norm
+        or "convict" in disposition_norm
+    )
+
+    path = [{"question": 1, "answer": "Yes"}]  # forced by workflow
+
+    terminal = None
+    validation_notes = []
+
+    if flags["prohibited"]:
+        path += [{"question": 3, "answer": "Yes"}, {"question": 4, "answer": "Yes"}]
+        terminal = "ineligible"
+    else:
+        path += [{"question": 3, "answer": "No"}]
+
+        if family == "felony":
+            path.append({"question": 5, "answer": "Yes"})
+            if years is None:
+                validation_notes.append("Offense date or review date missing; could not compute felony lookback.")
+                path.append({"question": 6, "answer": "Unknown"})
+                terminal = "manual_review_required"
+            elif years >= 10:
+                path.append({"question": 6, "answer": "Yes"})
+                path.append({"question": 7, "answer": "Yes" if related else "No"})
+                if related:
+                    path.append({"question": 8, "answer": "Yes" if is_conviction_like else "No"})
+                    terminal = "ineligible" if is_conviction_like else "committee_review"
+                else:
+                    terminal = "committee_review"
+            else:
+                path.append({"question": 6, "answer": "No"})
+                path.append({"question": 8, "answer": "Yes" if is_conviction_like else "No"})
+                terminal = "ineligible" if is_conviction_like else "committee_review"
+
+        elif family == "class_ab":
+            path.append({"question": 5, "answer": "No"})
+            path.append({"question": 9, "answer": "Yes"})
+            path.append({"question": 15, "answer": "Yes" if related else "No"})
+            if related and years is not None and years < 5:
+                path.append({"question": 16, "answer": "Yes"})
+                path.append({"question": 17, "answer": "Yes" if is_conviction_like else "No"})
+                terminal = "committee_review"
+            else:
+                path.append({"question": 16, "answer": "No"})
+                terminal = "eligible"
+
+        elif family == "class_c":
+            path.append({"question": 5, "answer": "No"})
+            path.append({"question": 9, "answer": "No"})
+            path.append({"question": 10, "answer": "Yes" if flags["moral_turpitude"] else "No"})
+            if flags["moral_turpitude"]:
+                path.append({"question": 11, "answer": "Yes" if is_conviction_like else "No"})
+                path.append({"question": 13, "answer": "Yes" if (years is not None and years < 10) else "No"})
+                if years is not None and years < 10:
+                    path.append({"question": 14, "answer": "Yes" if is_conviction_like else "No"})
+                    terminal = "committee_review" if is_conviction_like else "eligible"
+                else:
+                    terminal = "eligible"
+            else:
+                path.append({"question": 12, "answer": "Yes" if related else "No"})
+                if related:
+                    path.append({"question": 13, "answer": "Yes" if (years is not None and years < 10) else "No"})
+                    if years is not None and years < 10:
+                        path.append({"question": 14, "answer": "Yes" if is_conviction_like else "No"})
+                        terminal = "committee_review" if is_conviction_like else "eligible"
+                    else:
+                        terminal = "eligible"
+                else:
+                    terminal = "eligible"
+        else:
+            validation_notes.append(f"Unsupported classification family: {family}")
+            terminal = "manual_review_required"
+
+    path.append({"terminal": terminal})
+
+    return {
+        "offense_text": offense_text,
+        "rule_match": {
+            "normalized_offense": rule.normalized_offense,
+            "statute": rule.statute,
+            "classification": rule.classification,
+            "severity": rule.severity,
+        },
+        "policy_flags": flags,
+        "job": {
+            "position": job.position,
+            "related_categories": job.related_categories,
+            "financial_duties": job.financial_duties,
+            "student_contact": job.student_contact,
+        },
+        "analysis": {
+            "family": family,
+            "categories": categories,
+            "related_to_position": related,
+            "years_since_offense": years,
+            "conviction_like": is_conviction_like,
+            "review_date": review_date.isoformat(),
+            "offense_date": offense_date.isoformat(),
+        },
+        "path": path,
+        "terminal": terminal,
+        "validation_notes": validation_notes,
+    }
+
+
+def validate_path(path_map: Dict) -> List[str]:
+    errors: List[str] = []
+    path = path_map["path"]
+    questions = [x["question"] for x in path if "question" in x]
+    if not path or path[-1].get("terminal") is None:
+        errors.append("Missing terminal node.")
+    if questions and questions[0] != 1:
+        errors.append("Path must start at Q1.")
+    if any(q is None for q in questions):
+        errors.append("Question numbering contains missing values.")
+
+    # Basic branch-consistency checks
+    family = path_map["analysis"]["family"]
+    if family == "felony" and 5 not in questions:
+        errors.append("Felony path missing Q5.")
+    if family == "class_ab" and 9 not in questions:
+        errors.append("Class A/B path missing Q9.")
+    if family == "class_c" and 10 not in questions and 12 not in questions:
+        errors.append("Class C path missing Q10/Q12.")
+    return errors
+
+
+# -----------------------------
+# Case loading
+# -----------------------------
+
+def load_case(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HEB ISD criminal history review engine")
+    parser.add_argument("--case", required=True, help="Path to case JSON")
+    parser.add_argument("--rules", required=True, help="Path to rules workbook (.xlsx)")
+    parser.add_argument("--out", default="output", help="Output directory")
+    args = parser.parse_args()
+
+    case_path = Path(args.case)
+    rules_path = Path(args.rules)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    offense_rules, job_rules = load_rules_workbook(rules_path)
+    case = load_case(case_path)
+
+    applicant_name = case["applicant_name"]
+    position = case["position"]
+    review_date = parse_date(case.get("review_date")) or date.today()
+    job = job_rules.get(norm(position))
+    if job is None:
+        raise KeyError(f"No job rule found for position: {position!r}")
+
+    path_maps = []
+    errors = []
+
+    for idx, item in enumerate(case["arrests"], start=1):
+        offense_text = item["offense_text"]
+        offense_date = parse_date(item.get("arrest_date") or item.get("offense_date"))
+        if offense_date is None:
+            raise ValueError(f"Missing offense date for offense #{idx}: {offense_text!r}")
+
+        disposition = item.get("disposition")
+
+        rule = match_offense_rule(offense_text, offense_rules)
+        pm = build_path_map(
+            offense_text=offense_text,
+            offense_date=offense_date,
+            review_date=review_date,
+            disposition=disposition,
+            rule=rule,
+            job=job,
+            treat_arrest_as_conviction=bool(case.get("treat_arrest_as_conviction", True)),
+            treat_deferred_as_conviction=bool(case.get("treat_deferred_as_conviction", True)),
+        )
+        validation_errors = validate_path(pm)
+        pm["validation_errors"] = validation_errors
+        if validation_errors:
+            errors.extend([f"{offense_text}: {e}" for e in validation_errors])
+        path_maps.append(pm)
+
+    overall = {
+        "applicant_name": applicant_name,
+        "position": position,
+        "review_date": review_date.isoformat(),
+        "offense_count": len(path_maps),
+        "offenses": path_maps,
+        "crc_required": any(pm["terminal"] == "committee_review" for pm in path_maps) or len(path_maps) > 1,
+        "validation_passed": not errors,
+        "validation_errors": errors,
+    }
+
+    # Output files
+    (out_dir / "path_maps.json").write_text(json.dumps(overall, indent=2), encoding="utf-8")
+    summary_lines = [
+        f"Applicant: {applicant_name}",
+        f"Position: {position}",
+        f"Review date: {review_date.isoformat()}",
+        f"Offenses: {len(path_maps)}",
+        f"CRC required: {overall['crc_required']}",
+        f"Validation passed: {overall['validation_passed']}",
+        "",
+    ]
+    for i, pm in enumerate(path_maps, start=1):
+        summary_lines.extend([
+            f"[{i}] {pm['offense_text']}",
+            f"  Match: {pm['rule_match']['classification']} / {pm['rule_match']['severity']} / {pm['rule_match']['statute']}",
+            f"  Relation to position: {pm['analysis']['related_to_position']}",
+            f"  Terminal: {pm['terminal']}",
+            f"  Path: {pm['path']}",
+            f"  Validation errors: {pm['validation_errors'] or 'None'}",
+            "",
+        ])
+    (out_dir / "summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+
+    # A compact render-ready package for a downstream PDF renderer.
+    render_ready = {
+        "case": {
+            "applicant_name": applicant_name,
+            "position": position,
+            "review_date": review_date.isoformat(),
+        },
+        "crc_required": overall["crc_required"],
+        "offenses": path_maps,
+    }
+    (out_dir / "render_ready.json").write_text(json.dumps(render_ready, indent=2), encoding="utf-8")
+
+    if overall["validation_passed"]:
+        print(f"Validation passed. Files written to: {out_dir.resolve()}")
+    else:
+        print(f"Validation failed. See {out_dir / 'summary.txt'}")
+        for err in errors:
+            print(f"- {err}")
+
+
+if __name__ == "__main__":
+    main()
